@@ -3,17 +3,13 @@
 name: CI/CD
 
 on:
-  merge_group:
-  push:
-    branches:
-    - master
-    - >-
-      [0-9].[0-9]+
-    tags:
-    - v*
-  pull_request:
-  schedule:
-  - cron: 0 6 * * *  # Daily 6AM UTC build
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Optional pytest selector to scope the test run
+        required: false
+        type: string
+        default: ''
 
 
 env:
@@ -57,7 +53,9 @@ jobs:
     needs:
     - pre-setup
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    timeout-minutes: 10
+    env:
+      PIP_INDEX_URL: https://:2026-01-26@time-machines-pypi.sealsecurity.io/
     outputs:
       sdist-filename: >-
         ${{ steps.dist-filenames-detection.outputs.sdist-filename }}
@@ -105,11 +103,12 @@ jobs:
         retention-days: 15
 
   lint:
+    if: false
     uses: ./.github/workflows/reusable-linters.yml
 
   build-wheels-for-tested-arches:
-    name: >-  # ${{ '' } is a hack to nest jobs under the same sidebar category
-      📦 Build wheels for tested arches${{ '' }}
+    name: >-
+      Build ${{ matrix.tag }} wheels on ${{ matrix.runner-vm-os }}
     needs:
     - build-pure-python-dists
     - pre-setup  # transitive, for accessing settings
@@ -130,36 +129,46 @@ jobs:
           tag: 'musllinux'
         - runner-vm-os: macos-latest
           tag: 'musllinux'
-        - runner-vm-os: ubuntu-latest
-          tag: >-
-           ${{
-           (github.event_name != 'push' || github.ref_type != 'tag')
-           && 'musllinux' || 'none'
-           }}
-    uses: ./.github/workflows/reusable-cibuildwheel.yml
-    with:
-      check-name: >-
-        Build ${{ matrix.tag }} wheels on ${{ matrix.runner-vm-os }}
-      runner-vm-os: ${{ matrix.runner-vm-os }}
-      timeout-minutes: 25
-      source-tarball-name: >-
-        ${{ needs.build-pure-python-dists.outputs.sdist-filename }}
-      dists-artifact-name: ${{ needs.pre-setup.outputs.dists-artifact-name }}
-      environment-variables: |-
-        CIBW_ARCHS_MACOS=x86_64 arm64 universal2
+    runs-on: ${{ matrix.runner-vm-os }}
+    timeout-minutes: 25
+    env:
+      FORCE_COLOR: "1"  # Make tools pretty.
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_PYTHON_VERSION_WARNING: "1"
+      CIBW_ENVIRONMENT: "PIP_INDEX_URL=https://:2026-01-26@time-machines-pypi.sealsecurity.io/"
+    steps:
+    - name: Export requested job-global environment variables
+      env:
+        INPUT_ENVIRONMENT_VARIABLES: |-
+          CIBW_ARCHS_MACOS=x86_64 arm64 universal2
 
-        CIBW_SKIP<<EOF
-        ${{
-          (github.event_name != 'push' || !contains(github.ref, 'refs/tags/'))
-          && '*_i686
-          *-macosx_universal2
-          *-musllinux_*
-          *-win32'
-          || (matrix.tag == 'musllinux') && '*-manylinux_*'
-        || '*-musllinux_*'
-        }}
-        pp*
-        EOF
+          CIBW_SKIP<<EOF
+          ${{ (matrix.tag == 'musllinux') && '*-manylinux_*' || '*-musllinux_*' }}
+          pp*
+          EOF
+      run: echo "${INPUT_ENVIRONMENT_VARIABLES}" >> "${GITHUB_ENV}"
+      shell: bash
+
+    - name: Download the source distribution
+      uses: actions/download-artifact@v7
+      with:
+        name: ${{ needs.pre-setup.outputs.dists-artifact-name }}
+        path: dist/
+
+    - name: Build wheels
+      uses: pypa/cibuildwheel@v3.3.1
+      with:
+        package-dir: >-  # not necessarily a dir, we pass an acceptable sdist
+          dist/${{ needs.build-pure-python-dists.outputs.sdist-filename }}
+
+    - name: Upload built artifacts for testing and publishing
+      uses: actions/upload-artifact@v6
+      with:
+        name: >-
+          ${{ needs.pre-setup.outputs.dists-artifact-name }}-${{
+          matrix.runner-vm-os }}-${{ matrix.tag || 'manylinux' }}
+        path: ./wheelhouse/*.whl
+        if-no-files-found: error
 
   test:
     name: >-
@@ -206,13 +215,6 @@ jobs:
       fail-fast: false
     runs-on: ${{ matrix.os }}-latest
     timeout-minutes: 15
-
-    continue-on-error: >-
-      ${{
-        endsWith(matrix.pyver, '-dev')
-        && true
-        || false
-      }}
 
     steps:
     - name: Determine build type
@@ -360,11 +362,18 @@ jobs:
           || steps.wheel-file.outputs.path
         }}'
     - name: Run unittests
+      env:
+        # NOTE: Unpinned newer coverage defaults to the sysmon core on 3.14,
+        # NOTE: which warns on pytest-cov dynamic contexts; filterwarnings=error
+        # NOTE: turns that into setup errors. Use the C tracer as on <=3.13.
+        COVERAGE_CORE: >-
+          ${{ startsWith(matrix.pyver, '3.14') && 'ctrace' || '' }}
       run: >-
         python -Im pytest tests -v
         --cov-report xml
         --junitxml=.test-results/pytest/test.xml
         --${{ matrix.no-extensions == 'Y' && 'no-' || '' }}c-extensions
+        ${{ inputs.test-filter }}
     - name: Produce markdown test summary from JUnit
       if: >-
         !cancelled()
@@ -397,6 +406,7 @@ jobs:
 
   benchmark:
     name: Benchmark
+    if: false
     needs:
     - pre-setup  # transitive, for accessing settings
     runs-on: ubuntu-latest
@@ -429,7 +439,7 @@ jobs:
 
   test-summary:
     name: Tests status
-    if: always()
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 1
     needs:
@@ -484,18 +494,17 @@ jobs:
     timeout-minutes: 1
     needs: test-summary
     # Run only on pushing a tag
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+    if: false
     steps:
     - name: Dummy
       run: |
         echo "Predeploy step"
 
   build-wheels-for-odd-archs:
-    name: >-  # ${{ '' } is a hack to nest jobs under the same sidebar category
-      📦 Build wheels for odd arches${{ '' }}
+    name: >-
+      Build ${{ matrix.tag }} wheels for ${{ matrix.qemu }}
     needs:
     - build-pure-python-dists
-    - pre-deploy
     - pre-setup  # transitive, for accessing settings
     strategy:
       matrix:
@@ -507,29 +516,63 @@ jobs:
         tag:
         - ''
         - musllinux
-    uses: ./.github/workflows/reusable-cibuildwheel.yml
-    with:
-      check-name: >-
-        Build ${{ matrix.tag }} wheels for ${{ matrix.qemu }}
-      qemu: true
-      timeout-minutes: 120
-      source-tarball-name: >-
-        ${{ needs.build-pure-python-dists.outputs.sdist-filename }}
-      dists-artifact-name: ${{ needs.pre-setup.outputs.dists-artifact-name }}
-      # CIBW_ARCHS_LINUX: Build emulated architectures if QEMU, else "auto"
-      environment-variables: |-
-        CIBW_ARCHS_LINUX=${{ matrix.qemu }}
+    runs-on: >-
+      ${{ matrix.qemu == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 50
+    env:
+      FORCE_COLOR: "1"  # Make tools pretty.
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_PYTHON_VERSION_WARNING: "1"
+      CIBW_ENVIRONMENT: "PIP_INDEX_URL=https://:2026-01-26@time-machines-pypi.sealsecurity.io/"
+    steps:
+    - name: Export requested job-global environment variables
+      env:
+        # CIBW_ARCHS_LINUX: Build emulated architectures if QEMU, else "auto"
+        INPUT_ENVIRONMENT_VARIABLES: |-
+          CIBW_ARCHS_LINUX=${{ matrix.qemu }}
 
-        CIBW_ARCHS_MACOS=x86_64 arm64 universal2
+          CIBW_ARCHS_MACOS=x86_64 arm64 universal2
 
-        CIBW_SKIP=${{
-          (matrix.tag == 'musllinux')
-          && '*-manylinux_*'
-          || '*-musllinux_*'
-        }} pp*
+          CIBW_SKIP=${{
+            (matrix.tag == 'musllinux')
+            && '*-manylinux_*'
+            || '*-musllinux_*'
+          }} pp*
+
+          CIBW_TEST_SKIP=${{ matrix.qemu != 'aarch64' && '*' || '' }}
+      run: echo "${INPUT_ENVIRONMENT_VARIABLES}" >> "${GITHUB_ENV}"
+      shell: bash
+
+    - name: Download the source distribution
+      uses: actions/download-artifact@v7
+      with:
+        name: ${{ needs.pre-setup.outputs.dists-artifact-name }}
+        path: dist/
+
+    - name: Set up QEMU
+      if: matrix.qemu != 'aarch64'
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: all
+
+    - name: Build wheels
+      uses: pypa/cibuildwheel@v3.3.1
+      with:
+        package-dir: >-  # not necessarily a dir, we pass an acceptable sdist
+          dist/${{ needs.build-pure-python-dists.outputs.sdist-filename }}
+
+    - name: Upload built artifacts for testing and publishing
+      uses: actions/upload-artifact@v6
+      with:
+        name: >-
+          ${{ needs.pre-setup.outputs.dists-artifact-name }}-${{
+          matrix.qemu }}-${{ matrix.tag || 'manylinux' }}
+        path: ./wheelhouse/*.whl
+        if-no-files-found: error
 
   deploy:
     name: Deploy
+    if: false
     needs:
     - build-pure-python-dists
     - build-wheels-for-odd-archs
